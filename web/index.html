@@ -32,7 +32,7 @@
          padding:10px 16px; background:var(--panel);
          border-bottom:1px solid #262a33; }
   label { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:5px; }
-  #term { margin:0; padding:12px 16px; height:calc(100vh - 210px);
+  #term { margin:0; padding:12px 16px; height:calc(100vh - 232px);
           overflow:auto; white-space:pre-wrap; word-break:break-all;
           line-height:1.45; background:#0b0d11; }
   #term .ts   { color:var(--dim); }
@@ -82,9 +82,11 @@
 
 <footer>
   <input type="text" id="input" placeholder="输入要发送到被测设备的内容，回车发送" disabled>
+  <label><input type="checkbox" id="hexSend"> HEX 发送</label>
   <label><input type="checkbox" id="addCRLF" checked> 追加 CRLF</label>
   <button id="btnSend" class="primary" disabled>发送</button>
 </footer>
+<div class="hint" id="sendHint"></div>
 
 <script>
 "use strict";
@@ -263,15 +265,46 @@ async function sendBytes(bytes) {
   }
 }
 
+/* 解析 HEX 字符串为字节数组，允许空格/逗号/分号/冒号/横线分隔以及 0x 前缀 */
+function parseHex(str) {
+  const cleaned = str.replace(/0x/gi, "").replace(/[\s,;:_-]/g, "");
+  if (!cleaned) return null;
+  const bad = cleaned.match(/[^0-9a-fA-F]/);
+  if (bad) throw new Error("HEX 含非法字符 “" + bad[0] + "”，仅支持 0-9 / A-F");
+  if (cleaned.length % 2 !== 0)
+    throw new Error("HEX 字符数必须为偶数（当前 " + cleaned.length + " 个）");
+  const out = new Uint8Array(cleaned.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(cleaned.substr(i * 2, 2), 16);
+  return out;
+}
+
+function toHexString(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(" ");
+}
+
 async function sendText() {
   const raw = $("input").value;
   if (!raw) return;
-  const text = $("addCRLF").checked ? raw + "\r\n" : raw;
+  let bytes, echo;
+  if ($("hexSend").checked) {
+    try {
+      bytes = parseHex(raw);
+    } catch (err) {
+      addError(err.message || String(err));
+      return;
+    }
+    if (!bytes || !bytes.length) return;
+    echo = toHexString(bytes);
+  } else {
+    const text = $("addCRLF").checked ? raw + "\r\n" : raw;
+    bytes = new TextEncoder().encode(text);
+    echo = text;
+  }
   /* 先回显再发送：保证本地回显显示在设备响应之前 */
-  addSent(text);
+  addSent(echo);
   $("input").value = "";
   try {
-    await sendBytes(new TextEncoder().encode(text));
+    await sendBytes(bytes);
   } catch (err) {
     addError(err.message || String(err));
   }
@@ -317,6 +350,20 @@ $("hexView").onchange = e => {
   rxLine = ""; hexLine = "";
   addSystem(hexMode ? "已切换为 HEX 显示" : "已切换为文本显示");
 };
+
+/* 发送模式切换：HEX 发送时忽略 CRLF 追加，直接发送解析出的原始字节 */
+function applySendMode() {
+  const hex = $("hexSend").checked;
+  $("addCRLF").disabled = hex;
+  $("input").placeholder = hex
+    ? "输入 HEX 字节，如 01 02 0A 或 01020A，回车发送"
+    : "输入要发送到被测设备的内容，回车发送";
+  $("sendHint").textContent = hex
+    ? "HEX 发送：支持空格/逗号等分隔符与 0x 前缀，例如 “0x01 0x02 FF”；将按原始字节发送，不追加 CRLF。"
+    : "";
+}
+$("hexSend").onchange = applySendMode;
+applySendMode();
 
 /* 环境检查 */
 if (!window.isSecureContext) {
