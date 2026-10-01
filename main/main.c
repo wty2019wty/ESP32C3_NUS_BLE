@@ -33,9 +33,14 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 #include "ble_uart.h"
+
+/* 射频功率运行时调整：esp_ble_tx_power_set()/esp_power_level_t 来自控制器 bt 组件，
+ * 该 API 与主机栈无关，NimBLE 下同样可用。 */
+#include "esp_bt.h"
 
 /* 连接调优需要直接调用 NimBLE GAP API（2M PHY / 连接参数）。
  * ble_uart 组件 REQUIRES bt，公共依赖会传递过来；main/CMakeLists.txt 亦显式列出 bt。 */
@@ -61,6 +66,20 @@
 #define TUNE_CONN_ITVL_MAX   12    /* 15ms  = 12 * 1.25ms */
 #define TUNE_SUPERVISION_TO  400   /* 4s    = 400 * 10ms  */
 
+/* ---- BLE 射频发射功率 -------------------------------------------------
+ * 本板 3.0V 供电：高功率档实际输出会衰减，发射峰值电流也更易把电源拉低，
+ * 因此默认取 +3dBm（兼顾距离与电源裕量）。芯片档位步进 3dB，运行时可用
+ * 控制命令 POWER=<dBm> 动态调整（自动就近吸附到支持的档位）。 */
+#define TX_POWER_DEFAULT_DBM  3
+
+/* 运行期允许的最大功率：3.0V 下超过约 +9dBm 会因电源跌落导致链路监督超时
+ * （disconnect reason 0x208），可在 menuconfig 里调整上限。 */
+#define TX_POWER_MAX_DBM      CONFIG_BRIDGE_TX_POWER_MAX_DBM
+
+/* 运行期设置的功率写入 NVS，掉电后仍生效（无记录时用上面的编译期默认值） */
+#define NVS_NS_BRIDGE         "bridge"
+#define NVS_KEY_TXPWR         "txpow"
+
 /* 控制帧魔术前缀："ESC B L" */
 #define CTL_MAGIC0          0x1B
 #define CTL_MAGIC1          'B'
@@ -75,6 +94,7 @@ static const char *TAG = "bridge";
 static StreamBufferHandle_t s_ble2uart;   /* BLE 写入 -> UART TX */
 static StreamBufferHandle_t s_uart2ble;   /* UART RX   -> BLE 通知 */
 static uint32_t             s_baud = DEFAULT_BAUD;
+static int                  s_tx_power_dbm = TX_POWER_DEFAULT_DBM;   /* 当前 BLE 发射功率(dBm) */
 
 /* 统计与诊断：用于判断「能发不能收」到底断在哪一段 */
 static volatile uint32_t    s_dropped_ble2uart;   /* BLE 写入过快被丢弃的字节数 */
@@ -88,6 +108,110 @@ static volatile bool        s_selftest_running;
 static volatile bool        s_link_up;
 
 static void selftest_task(void *arg);
+
+/* ------------------------------------------------------------------ */
+/* 射频功率：dBm <-> 控制器档位 映射与设置                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int               dbm;
+    esp_power_level_t lvl;
+} tx_pwr_step_t;
+
+/* 控制器支持的档位（步进 3dB；最高 +20dBm 对应 ESP_PWR_LVL_P20） */
+static const tx_pwr_step_t s_tx_pwr_tab[] = {
+    { -24, ESP_PWR_LVL_N24 }, { -21, ESP_PWR_LVL_N21 }, { -18, ESP_PWR_LVL_N18 },
+    { -15, ESP_PWR_LVL_N15 }, { -12, ESP_PWR_LVL_N12 }, {  -9, ESP_PWR_LVL_N9  },
+    {  -6, ESP_PWR_LVL_N6  }, {  -3, ESP_PWR_LVL_N3  }, {   0, ESP_PWR_LVL_N0  },
+    {   3, ESP_PWR_LVL_P3  }, {   6, ESP_PWR_LVL_P6  }, {   9, ESP_PWR_LVL_P9  },
+    {  12, ESP_PWR_LVL_P12 }, {  15, ESP_PWR_LVL_P15 }, {  18, ESP_PWR_LVL_P18 },
+    {  20, ESP_PWR_LVL_P20 },
+};
+#define TX_PWR_TAB_N (sizeof(s_tx_pwr_tab) / sizeof(s_tx_pwr_tab[0]))
+
+/* 把任意 dBm 就近吸附到支持档位；out_dbm 回传实际档位 */
+static esp_power_level_t tx_power_nearest(int dbm, int *out_dbm)
+{
+    size_t best = 0;
+    int best_diff = abs(dbm - s_tx_pwr_tab[0].dbm);
+    for (size_t i = 1; i < TX_PWR_TAB_N; i++) {
+        int d = abs(dbm - s_tx_pwr_tab[i].dbm);
+        if (d < best_diff) {
+            best_diff = d;
+            best = i;
+        }
+    }
+    if (out_dbm) {
+        *out_dbm = s_tx_pwr_tab[best].dbm;
+    }
+    return s_tx_pwr_tab[best].lvl;
+}
+
+/* 设置 BLE 发射功率：默认(涵盖此后建立的连接) + 广播 + 扫描都设一遍，
+ * 并对当前已建立的连接立即生效（否则旧连接的功率仍是建立时的旧值）。
+ * 该函数在 BLE 主机任务上下文调用（handle_control / app_main）。 */
+static esp_err_t tx_power_apply(int dbm, int *applied_dbm)
+{
+    int got = 0;
+    esp_power_level_t lvl = tx_power_nearest(dbm, &got);
+
+    esp_err_t e_def = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, lvl);
+    esp_err_t e_adv = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, lvl);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, lvl);   /* 本机不扫描，失败可忽略 */
+
+    /* 已建立的连接逐个改（CONN_HDLx 与连接句柄一一对应） */
+    for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(h, &desc) != 0) {
+            continue;
+        }
+        esp_ble_tx_power_set((esp_ble_power_type_t)(ESP_BLE_PWR_TYPE_CONN_HDL0 + h), lvl);
+    }
+
+    if (e_def != ESP_OK && e_adv != ESP_OK) {
+        return (e_def != ESP_OK) ? e_def : e_adv;
+    }
+    s_tx_power_dbm = got;
+    if (applied_dbm) {
+        *applied_dbm = got;
+    }
+    return ESP_OK;
+}
+
+/* 从 NVS 读取上次保存的发射功率；无记录或越界返回 false */
+static bool tx_power_nvs_load(int *dbm)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_BRIDGE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    int8_t v = 0;
+    esp_err_t err = nvs_get_i8(h, NVS_KEY_TXPWR, &v);
+    nvs_close(h);
+    if (err != ESP_OK || v < -24 || v > 20) {
+        return false;
+    }
+    *dbm = (int)v;
+    return true;
+}
+
+/* 把功率写入 NVS（失败仅告警，不影响本次运行） */
+static void tx_power_nvs_save(int dbm)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_BRIDGE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "NVS 打开失败，功率未持久化");
+        return;
+    }
+    esp_err_t err = nvs_set_i8(h, NVS_KEY_TXPWR, (int8_t)dbm);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "功率写入 NVS 失败：%s", esp_err_to_name(err));
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* 设备 -> 网页：发送一条控制/状态帧                                     */
@@ -151,9 +275,9 @@ static void handle_control(const uint8_t *data, size_t len)
             ctl_send("ERR BAUD %s", esp_err_to_name(err));
         }
     } else if (strncmp(p, "STATUS", 6) == 0) {
-        ctl_send("STATUS BAUD %" PRIu32 " TX %d RX %d B2U %" PRIu32
+        ctl_send("STATUS BAUD %" PRIu32 " PWR %d TX %d RX %d B2U %" PRIu32
                  " U2B %" PRIu32 " DROP %" PRIu32,
-                 s_baud, DUT_TX_GPIO, DUT_RX_GPIO,
+                 s_baud, s_tx_power_dbm, DUT_TX_GPIO, DUT_RX_GPIO,
                  s_ble_rx_total, s_uart_rx_total, s_dropped_ble2uart);
     } else if (strncmp(p, "FLUSH", 5) == 0) {
         uart_flush_input(DUT_UART);
@@ -161,6 +285,39 @@ static void handle_control(const uint8_t *data, size_t len)
         xStreamBufferReset(s_uart2ble);
         s_dropped_ble2uart = 0;
         ctl_send("OK FLUSH");
+    } else if (strncmp(p, "POWER", 5) == 0) {
+        /* POWER         -> 回报当前发射功率
+         * POWER=<dBm>   -> 设置（就近吸附到芯片支持的 3dB 档，范围 -24..+20） */
+        char *arg = p + 5;
+        while (*arg == ' ' || *arg == '\t' || *arg == '=' || *arg == ':') {
+            arg++;
+        }
+        if (*arg == '\0') {
+            ctl_send("OK POWER %d", s_tx_power_dbm);
+        } else {
+            char *end = NULL;
+            long dbm = strtol(arg, &end, 10);
+            while (end && (*end == ' ' || *end == '\t')) {
+                end++;
+            }
+            if (end == arg || (end && *end != '\0')) {
+                ctl_send("ERR POWER invalid");
+                return;
+            }
+            if (dbm < -24 || dbm > TX_POWER_MAX_DBM) {
+                ctl_send("ERR POWER range -24..%d", TX_POWER_MAX_DBM);
+                return;
+            }
+            int applied = 0;
+            esp_err_t err = tx_power_apply((int)dbm, &applied);
+            if (err == ESP_OK) {
+                tx_power_nvs_save(applied);   /* 持久化：掉电后仍按此档位 */
+                ESP_LOGI(TAG, "射频功率已切换为 %d dBm", applied);
+                ctl_send("OK POWER %d", applied);
+            } else {
+                ctl_send("ERR POWER %s", esp_err_to_name(err));
+            }
+        }
     } else if (strncmp(p, "PING", 4) == 0) {
         ctl_send("PONG");
     } else if (strncmp(p, "SELFTEST", 8) == 0) {
@@ -229,7 +386,7 @@ static void ble_on_event(const ble_uart_evt_t *e)
         ESP_LOGI(TAG, "TX 通知%s", e->subscribed.subscribed ? "已订阅" : "已取消");
         if (e->subscribed.subscribed) {
             /* 网页订阅成功后主动回报当前状态 */
-            ctl_send("READY BAUD %" PRIu32, s_baud);
+            ctl_send("READY BAUD %" PRIu32 " PWR %d", s_baud, s_tx_power_dbm);
         }
         break;
     default:
@@ -467,6 +624,25 @@ void app_main(void)
         .on_event       = ble_on_event,
     }));
     ESP_ERROR_CHECK(ble_uart_open());
+
+    /* 射频功率：优先用 NVS 里上次保存的档位（掉电持久化），无记录时退回
+     * 编译期默认值（+3dBm @3.0V）。之后网页端可用 POWER=<dBm> 调整并保存。 */
+    int boot_dbm = TX_POWER_DEFAULT_DBM;
+    if (tx_power_nvs_load(&boot_dbm)) {
+        ESP_LOGI(TAG, "读取到已保存的射频功率 %d dBm", boot_dbm);
+    }
+    if (boot_dbm > TX_POWER_MAX_DBM) {
+        /* 兼容旧版本存下来的超上限值（如误设的 +20dBm），上电直接钳位 */
+        ESP_LOGW(TAG, "已保存功率 %d dBm 超过上限，钳位到 %d dBm", boot_dbm, TX_POWER_MAX_DBM);
+        boot_dbm = TX_POWER_MAX_DBM;
+    }
+    int pwr_applied = 0;
+    esp_err_t pwr_err = tx_power_apply(boot_dbm, &pwr_applied);
+    if (pwr_err == ESP_OK) {
+        ESP_LOGI(TAG, "射频发射功率 = %d dBm", pwr_applied);
+    } else {
+        ESP_LOGW(TAG, "射频功率设置失败：%s（沿用控制器默认档）", esp_err_to_name(pwr_err));
+    }
 
     ESP_LOGI(TAG, "BLE 已启动，广播名 '%s'（广播短名 'C3-UART'）", name);
 }

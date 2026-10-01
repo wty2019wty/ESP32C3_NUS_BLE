@@ -68,6 +68,15 @@
     </select>
   </label>
   <button id="btnBaud" disabled>应用</button>
+  <label>发射功率
+    <select id="power">
+      <!-- 上限与固件 CONFIG_BRIDGE_TX_POWER_MAX_DBM(默认+9) 对应；若上调该配置，请在此补充选项 -->
+      <option>9</option><option>6</option><option selected>3</option><option>0</option>
+      <option>-3</option><option>-6</option><option>-9</option><option>-12</option>
+      <option>-18</option><option>-24</option>
+    </select>
+  </label>
+  <button id="btnPower" disabled>应用功率</button>
   <button id="btnStatus" disabled>读取状态</button>
   <button id="btnFlush" disabled>清空缓冲</button>
   <button id="btnSelftest" disabled>自检</button>
@@ -419,7 +428,7 @@ function setConnected(on, text) {
   $("dot").classList.toggle("on", on);
   $("btnConnect").disabled = on;
   $("btnDisconnect").disabled = !on;
-  ["btnBaud", "btnStatus", "btnFlush", "btnSelftest", "btnUvk6", "btnSend", "input"].forEach(id => { $(id).disabled = !on; });
+  ["btnBaud", "power", "btnPower", "btnStatus", "btnFlush", "btnSelftest", "btnUvk6", "btnSend", "input"].forEach(id => { $(id).disabled = !on; });
 }
 
 /* ---------------- 发送 ---------------- */
@@ -491,6 +500,10 @@ $("input").addEventListener("keydown", e => { if (e.key === "Enter") { e.prevent
 
 $("btnBaud").onclick = async () => {
   try { await sendControl("BAUD=" + $("baud").value); }
+  catch (err) { addError(err.message || String(err)); }
+};
+$("btnPower").onclick = async () => {
+  try { await sendControl("POWER=" + $("power").value); }
   catch (err) { addError(err.message || String(err)); }
 };
 $("btnStatus").onclick = async () => {

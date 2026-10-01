@@ -45,4 +45,14 @@ menu "BLE <-> UART 桥接配置"
             用于判断「能发不能收」是断在 UART 接收还是 BLE 通知。
             日常使用建议关闭，避免正常收发日志刷屏。
 
+    config BRIDGE_TX_POWER_MAX_DBM
+        int "BLE 发射功率上限 (dBm)"
+        range -24 20
+        default 9
+        help
+            运行期 POWER 命令允许设置的最大发射功率。
+            本板 3.0V 供电，高功率档会使发射峰值电流骤增、电源跌落、RF 失锁，
+            进而连接监督超时掉线（disconnect reason 0x208 = Connection Timeout）。
+            因此默认限制在 +9dBm；供电充足时可上调，但不建议超过 +9。
+
 endmenu

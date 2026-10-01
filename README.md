@@ -114,7 +114,9 @@ HEX 显示、自动滚动、本地回显、发送时自动追加 CRLF。
 | 命令（前缀之后） | 作用 |
 |---|---|
 | `BAUD=<n>` / `BAUD <n>` / `BAUD:<n>` | 切换 UART 波特率（300 ~ 5000000） |
-| `STATUS` | 查询当前波特率、引脚、丢包计数 |
+| `POWER=<n>` / `POWER <n>` / `POWER:<n>` | 设置 BLE 发射功率（dBm，-24 ~ 上限，默认上限 +9，就近吸附到 3dB 档，**写入 NVS 掉电保存**） |
+| `POWER` | 查询当前 BLE 发射功率，回 `OK POWER <dBm>` |
+| `STATUS` | 查询当前波特率、射频功率、引脚、丢包计数 |
 | `FLUSH` | 清空 UART 输入与收发缓冲，并把 `DROP` 清零 |
 | `PING` | 连通性测试，回 `PONG` |
 | `SELFTEST` | UART 环回自检，回 `PASS`/`FAIL`（需把 TX-RX 短接） |
@@ -127,11 +129,14 @@ HEX 显示、自动滚动、本地回显、发送时自动追加 CRLF。
 `[设备]` 系统消息，不混入串口数据：
 
 ```
-[设备] READY BAUD 115200
+[设备] READY BAUD 115200 PWR 3
 [设备] OK BAUD 921600
-[设备] STATUS BAUD 921600 TX 4 RX 5 B2U 5 U2B 5 DROP 0
+[设备] OK POWER 0
+[设备] STATUS BAUD 921600 PWR 0 TX 4 RX 5 B2U 5 U2B 5 DROP 0
 [设备] PONG
 [设备] ERR BAUD invalid
+[设备] ERR POWER range -24..9
+[设备] ERR POWER invalid
 [设备] OK SELFTEST started
 [设备] SELFTEST sent=33/33 got=33 PASS
 ```
@@ -170,8 +175,21 @@ SELFTEST sent=<写入>/<期望> got=<收回> PASS|FAIL
 | `BRIDGE_BAUD` | `115200` | 上电默认波特率，可网页动态改 |
 | `BRIDGE_BUF_SIZE` | `4096` | BLE↔UART StreamBuffer 大小（字节） |
 | `BRIDGE_RX_DEBUG_LOG` | `n` | 打开后每收到一段 UART 数据就打印一行日志，排查接收问题用 |
+| `BRIDGE_TX_POWER_MAX_DBM` | `9` | 运行期 `POWER` 命令允许的最大发射功率（dBm） |
 
 > `BRIDGE_RX_DEBUG_LOG` 属于除错开关，量产/日常使用可关掉以减少日志刷屏。
+
+**BLE 发射功率**（不在上面这个菜单里）：`idf.py menuconfig →
+Component config → Bluetooth → Controller → BLE default Tx power level`，
+或直接改 `sdkconfig.defaults` 里的
+`CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_*`。本工程 3.0V 供电，默认取 **+3dBm**
+（`..._P3=y`），兼顾通信距离与电源裕量；运行时可用 `POWER=<dBm>` 命令再调，
+该命令会把档位写入 NVS，**掉电重启后仍按上次设置生效**（无 NVS 记录时才用
+上面这个编译期默认值）。
+
+> 由于 3.0V 下高功率会导致电源跌落、连接监督超时掉线（`reason 0x208`），
+> 运行期 `POWER` 受 `BRIDGE_TX_POWER_MAX_DBM`（默认 `+9`）上限约束；且上电时
+> 若发现 NVS 里存了超过上限的旧值会自动钳位到上限。
 
 ---
 
@@ -180,11 +198,12 @@ SELFTEST sent=<写入>/<期望> got=<收回> PASS|FAIL
 ### 8.1 先看 `STATUS` 的计数
 
 ```
-STATUS BAUD <波特率> TX <脚> RX <脚> B2U <n> U2B <n> DROP <n>
+STATUS BAUD <波特率> PWR <dBm> TX <脚> RX <脚> B2U <n> U2B <n> DROP <n>
 ```
 
 | 字段 | 含义 | 判读 |
 |---|---|---|
+| `PWR` | 当前 BLE 发射功率(dBm) | 可用 `POWER=<dBm>` 动态调整 |
 | `B2U` | 网页 → 设备 已转发字节数 | 发数据后应增长 |
 | `U2B` | 设备 → 网页 已收到字节数 | 设备回数据后应增长 |
 | `DROP` | BLE 写入过快被丢弃的字节数 | 持续增长说明写得太快，可降速或加大缓冲 |
