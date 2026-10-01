@@ -1,0 +1,48 @@
+menu "BLE <-> UART 桥接配置"
+
+    config BRIDGE_UART_NUM
+        int "被测设备 UART 端口号 (0 或 1)"
+        range 0 1
+        default 1
+        help
+            ESP32-C3 默认控制台在 UART0（或 USB Serial/JTAG），
+            为避免日志与被测设备数据冲突，桥接默认使用 UART1。
+
+    config BRIDGE_UART_TX
+        int "被测设备 UART TX GPIO (C3 -> DUT)"
+        default 4
+        help
+            默认 GPIO4。请避开 ESP32-C3 的 strapping 引脚 GPIO2/GPIO8/GPIO9：
+            GPIO8 常接板载 LED、GPIO9 接 BOOT 按键，用作 UART 会干扰收发。
+            注意：GPIO4/GPIO5 是 JTAG 脚，选用后无法再使用 JTAG 调试。
+
+    config BRIDGE_UART_RX
+        int "被测设备 UART RX GPIO (DUT -> C3)"
+        default 5
+        help
+            默认 GPIO5。实测：把 RX 放在 GPIO9（BOOT/strapping 脚）上时，
+            即使外部把 TX/RX 短接做环回，UART 接收方向也收不到数据
+            （B2U 增长而 U2B 恒为 0）。因此默认改用 GPIO5。
+
+    config BRIDGE_BAUD
+        int "默认波特率"
+        default 115200
+        help
+            上电默认波特率。连接后可在网页端通过控制协议动态修改。
+
+    config BRIDGE_BUF_SIZE
+        int "收发流缓冲大小 (字节)"
+        default 4096
+        help
+            BLE 与 UART 之间的 FreeRTOS StreamBuffer 大小。
+            缓冲写满时的策略见 main.c（默认丢弃并计数）。
+
+    config BRIDGE_RX_DEBUG_LOG
+        bool "把 UART 收到的字节实时打印到日志 (排查接收问题用)"
+        default n
+        help
+            开启后，每从 UART 收到一段数据就打印一行日志。
+            用于判断「能发不能收」是断在 UART 接收还是 BLE 通知。
+            日常使用建议关闭，避免正常收发日志刷屏。
+
+endmenu

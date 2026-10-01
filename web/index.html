@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-C3 蓝牙串口调试器</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --fg:#d7dae0; --dim:#8b93a1;
+          --accent:#4ea1ff; --ok:#3ddc84; --warn:#ffb020; --err:#ff5c5c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:"Consolas","Cascadia Mono",Menlo,monospace; font-size:14px; }
+  header { padding:12px 16px; background:var(--panel);
+           border-bottom:1px solid #262a33; display:flex; flex-wrap:wrap;
+           gap:10px; align-items:center; }
+  h1 { font-size:15px; margin:0 14px 0 0; font-weight:600; }
+  button { background:#222832; color:var(--fg); border:1px solid #333b48;
+           border-radius:6px; padding:6px 12px; cursor:pointer; font-family:inherit;
+           font-size:13px; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); color:#04101f; border-color:var(--accent);
+                   font-weight:600; }
+  select, input[type=text] { background:#0c0e13; color:var(--fg);
+           border:1px solid #333b48; border-radius:6px; padding:6px 8px;
+           font-family:inherit; font-size:13px; }
+  .status { font-size:13px; color:var(--dim); margin-left:auto; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+         background:#555; margin-right:6px; vertical-align:middle; }
+  .dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+         padding:10px 16px; background:var(--panel);
+         border-bottom:1px solid #262a33; }
+  label { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:5px; }
+  #term { margin:0; padding:12px 16px; height:calc(100vh - 210px);
+          overflow:auto; white-space:pre-wrap; word-break:break-all;
+          line-height:1.45; background:#0b0d11; }
+  #term .sys  { color:var(--warn); }
+  #term .sent { color:var(--accent); }
+  #term .err  { color:var(--err); }
+  footer { display:flex; gap:8px; padding:10px 16px; background:var(--panel);
+           border-top:1px solid #262a33; }
+  footer input[type=text] { flex:1; }
+  .hint { color:var(--dim); font-size:12px; padding:6px 16px 0; }
+  .hint.err { color:var(--err); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ESP32-C3 串口调试器</h1>
+  <button id="btnConnect" class="primary">连接</button>
+  <button id="btnDisconnect" disabled>断开</button>
+  <span class="status"><span class="dot" id="dot"></span><span id="status">未连接</span></span>
+</header>
+
+<div class="bar">
+  <label>波特率
+    <select id="baud">
+      <option>9600</option><option>19200</option><option>38400</option>
+      <option>57600</option><option selected>115200</option><option>230400</option>
+      <option>460800</option><option>921600</option><option>1500000</option>
+    </select>
+  </label>
+  <button id="btnBaud" disabled>应用</button>
+  <button id="btnStatus" disabled>读取状态</button>
+  <button id="btnFlush" disabled>清空缓冲</button>
+  <button id="btnSelftest" disabled>自检</button>
+  <span style="flex:1"></span>
+  <label><input type="checkbox" id="hexView"> HEX 显示</label>
+  <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+  <label><input type="checkbox" id="localEcho"> 本地回显</label>
+  <button id="btnClear">清屏</button>
+</div>
+
+<div class="hint" id="hint">提示：Web Bluetooth 需要安全上下文，请用
+  <b>https</b> 或 <b>http://localhost</b> 打开本页；且需 Chrome / Edge 浏览器。</div>
+
+<pre id="term"></pre>
+
+<footer>
+  <input type="text" id="input" placeholder="输入要发送到被测设备的内容，回车发送" disabled>
+  <label><input type="checkbox" id="addCRLF" checked> 追加 CRLF</label>
+  <button id="btnSend" class="primary" disabled>发送</button>
+</footer>
+
+<script>
+"use strict";
+
+/* NUS UUID（与固件 ble_uart 组件一致） */
+const SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // 网页 -> 设备（写）
+const TX  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // 设备 -> 网页（通知）
+
+/* 控制帧魔术前缀 "ESC B L" */
+const MAGIC = [0x1B, 0x42, 0x4C];
+const CHUNK = 20;   // 发送分片，兼容最小 MTU
+
+const $ = id => document.getElementById(id);
+const term = $("term");
+
+let device, server, rxChar, txChar;
+let decoder = new TextDecoder("utf-8");
+let hexMode = false;
+
+/* ---------------- 终端输出 ---------------- */
+function scroll() {
+  if ($("autoScroll").checked) term.scrollTop = term.scrollHeight;
+}
+function appendNode(node) { term.appendChild(node); scroll(); }
+function addText(s) { appendNode(document.createTextNode(s)); }
+function addSystem(s) {
+  const span = document.createElement("span");
+  span.className = "sys";
+  span.textContent = "\n[设备] " + s + "\n";
+  appendNode(span);
+}
+function addSent(s) {
+  if (!$("localEcho").checked) return;
+  const span = document.createElement("span");
+  span.className = "sent";
+  span.textContent = "> " + s;
+  appendNode(span);
+}
+function addError(s) {
+  const span = document.createElement("span");
+  span.className = "err";
+  span.textContent = "\n[错误] " + s + "\n";
+  appendNode(span);
+}
+
+/* ---------------- 接收：字节流解析（可跨通知分片） ---------------- */
+let state = 0;          // 0=普通 1=ESC 2=ESC+B 3=控制帧内
+let ctlBuf = "";
+
+function feed(b) {
+  switch (state) {
+    case 0:
+      if (b === MAGIC[0]) state = 1; else pushData(b);
+      break;
+    case 1:
+      if (b === MAGIC[1]) state = 2;
+      else { pushData(MAGIC[0]); if (b === MAGIC[0]) state = 1; else { state = 0; pushData(b); } }
+      break;
+    case 2:
+      if (b === MAGIC[2]) { state = 3; ctlBuf = ""; }
+      else {
+        pushData(MAGIC[0]); pushData(MAGIC[1]);
+        if (b === MAGIC[0]) state = 1; else { state = 0; pushData(b); }
+      }
+      break;
+    case 3:
+      if (b === 0x0A) { addSystem(ctlBuf); state = 0; }
+      else ctlBuf += String.fromCharCode(b);
+      break;
+  }
+}
+
+function pushData(b) {
+  if (hexMode) {
+    addText(b.toString(16).padStart(2, "0") + " ");
+  } else {
+    addText(decoder.decode(Uint8Array.of(b), { stream: true }));
+  }
+}
+
+function onData(e) {
+  const dv = e.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  for (const b of bytes) feed(b);
+}
+
+/* ---------------- 连接 / 断开 ---------------- */
+async function connect() {
+  try {
+    if (!navigator.bluetooth) throw new Error("当前浏览器不支持 Web Bluetooth");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SVC] }],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    rxChar = await svc.getCharacteristic(RX);
+    txChar = await svc.getCharacteristic(TX);
+
+    await txChar.startNotifications();
+    txChar.addEventListener("characteristicvaluechanged", onData);
+
+    setConnected(true, device.name || "(未命名)");
+    addSystem("已连接 " + (device.name || "") + "，正在查询状态…");
+    await sendControl("STATUS");
+  } catch (err) {
+    if (err && err.name === "NotFoundError") return; // 用户取消选择
+    addError(err.message || String(err));
+  }
+}
+
+function onDisconnected() {
+  setConnected(false, "已断开");
+  addSystem("连接已断开");
+}
+
+async function disconnect() {
+  try { if (txChar) await txChar.stopNotifications(); } catch (_) {}
+  try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+  setConnected(false, "未连接");
+}
+
+function setConnected(on, text) {
+  $("status").textContent = text;
+  $("dot").classList.toggle("on", on);
+  $("btnConnect").disabled = on;
+  $("btnDisconnect").disabled = !on;
+  ["btnBaud", "btnStatus", "btnFlush", "btnSelftest", "btnSend", "input"].forEach(id => { $(id).disabled = !on; });
+}
+
+/* ---------------- 发送 ---------------- */
+async function sendBytes(bytes) {
+  if (!rxChar) throw new Error("未连接");
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    await rxChar.writeValueWithoutResponse(bytes.slice(i, i + CHUNK));
+  }
+}
+
+async function sendText() {
+  const raw = $("input").value;
+  if (!raw) return;
+  const text = $("addCRLF").checked ? raw + "\r\n" : raw;
+  try {
+    await sendBytes(new TextEncoder().encode(text));
+    addSent(text);
+    $("input").value = "";
+  } catch (err) {
+    addError(err.message || String(err));
+  }
+}
+
+async function sendControl(cmd) {
+  const body = new TextEncoder().encode(cmd);
+  const frame = new Uint8Array(MAGIC.length + body.length);
+  frame.set(MAGIC, 0);
+  frame.set(body, MAGIC.length);
+  await sendBytes(frame);
+}
+
+/* ---------------- 事件绑定 ---------------- */
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = disconnect;
+$("btnSend").onclick = sendText;
+$("input").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); sendText(); } });
+
+$("btnBaud").onclick = async () => {
+  try { await sendControl("BAUD=" + $("baud").value); }
+  catch (err) { addError(err.message || String(err)); }
+};
+$("btnStatus").onclick = async () => {
+  try { await sendControl("STATUS"); } catch (err) { addError(err.message || String(err)); }
+};
+$("btnFlush").onclick = async () => {
+  try { await sendControl("FLUSH"); } catch (err) { addError(err.message || String(err)); }
+};
+$("btnSelftest").onclick = async () => {
+  try { await sendControl("SELFTEST"); } catch (err) { addError(err.message || String(err)); }
+};
+$("btnClear").onclick = () => { term.textContent = ""; decoder = new TextDecoder("utf-8"); };
+
+$("hexView").onchange = e => {
+  hexMode = e.target.checked;
+  term.textContent = "";
+  decoder = new TextDecoder("utf-8");
+  addSystem(hexMode ? "已切换为 HEX 显示" : "已切换为文本显示");
+};
+
+/* 环境检查 */
+if (!window.isSecureContext) {
+  $("hint").classList.add("err");
+  $("hint").textContent = "当前不是安全上下文（https / localhost），Web Bluetooth 将不可用。";
+}
+</script>
+</body>
+</html>
