@@ -45,6 +45,9 @@
   footer input[type=text] { flex:1; }
   .hint { color:var(--dim); font-size:12px; padding:6px 16px 0; }
   .hint.err { color:var(--err); }
+  #uvinfo { padding:6px 16px 0; color:var(--dim); font-size:12px; }
+  #uvinfo b { color:var(--ok); font-weight:600; }
+  #uvinfo .kv { color:var(--fg); }
 </style>
 </head>
 <body>
@@ -68,6 +71,7 @@
   <button id="btnStatus" disabled>读取状态</button>
   <button id="btnFlush" disabled>清空缓冲</button>
   <button id="btnSelftest" disabled>自检</button>
+  <button id="btnUvk6" disabled>查询UVK6设备信息</button>
   <span style="flex:1"></span>
   <label><input type="checkbox" id="hexView"> HEX 显示</label>
   <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
@@ -87,6 +91,7 @@
   <button id="btnSend" class="primary" disabled>发送</button>
 </footer>
 <div class="hint" id="sendHint"></div>
+<div id="uvinfo"></div>
 
 <script>
 "use strict";
@@ -102,6 +107,7 @@ const CHUNK = 20;   // 发送分片，兼容最小 MTU
 
 const $ = id => document.getElementById(id);
 const term = $("term");
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let device, server, rxChar, txChar;
 let decoder = new TextDecoder("utf-8");
@@ -144,6 +150,159 @@ function addSent(s) {
 function addError(s) {
   flushRx();
   addLine("[错误]", s, "err");
+}
+
+/* ================================================================== */
+/* UV-K6（罗师虎 LOSEHU 固件）串口协议：查询设备信息                     */
+/*                                                                    */
+/* 帧格式:  AB CD | Size(2B,小端) | Payload(Size) | CRC16(2B,小端) | DC BA
+/* 应答:    AB CD | Size(2B,小端) | 内层报文(Size) | 填充(2B) | DC BA      */
+/*   - Payload = [命令ID(2B,小端)][数据...]                             */
+/*   - CRC16-CCITT/XMODEM（poly 0x1021，初值 0），仅覆盖 Payload         */
+/*   - 查询命令 0x0514（数据为 4 字节时间戳/会话ID）                     */
+/*   - 应答 0x0515 = 版本字符串(16B) + 自定义AES(1B) + 锁屏(1B) + ...    */
+/* ================================================================== */
+
+const UVK6_BAUD = "38400";      // UV-K5/K6 标准波特率
+
+function crc16xmodem(bytes) {
+  let crc = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    crc ^= (bytes[i] << 8) & 0xffff;
+    for (let b = 0; b < 8; b++) {
+      crc = (crc & 0x8000) ? (((crc << 1) ^ 0x1021) & 0xffff) : ((crc << 1) & 0xffff);
+    }
+  }
+  return crc & 0xffff;
+}
+
+/* 组帧：cmdId 为命令 ID，data 为数据字节数组 */
+function buildUvk6Frame(cmdId, data) {
+  const payload = new Uint8Array(2 + data.length);
+  payload[0] = cmdId & 0xff;
+  payload[1] = (cmdId >> 8) & 0xff;
+  payload.set(data, 2);
+
+  const crc = crc16xmodem(payload);
+  const frame = new Uint8Array(2 + 2 + payload.length + 2 + 2);
+  frame[0] = 0xAB;
+  frame[1] = 0xCD;
+  frame[2] = payload.length & 0xff;
+  frame[3] = (payload.length >> 8) & 0xff;
+  frame.set(payload, 4);
+  frame[4 + payload.length] = crc & 0xff;
+  frame[5 + payload.length] = (crc >> 8) & 0xff;
+  frame[6 + payload.length] = 0xDC;
+  frame[7 + payload.length] = 0xBA;
+  return frame;
+}
+
+/* ---------------- 应答解析状态机（逐字节喂入，可跨 BLE 分片） ---------------- */
+let uvState = 0;        // 0找AB 1找CD 2/3读长度 4收Payload 5/6填充 7找DC 8找BA
+let uvSize = 0;
+let uvBuf = [];
+let uvWaitTimer = null;
+let uvGot = false;      // 本轮查询是否收到过应答
+
+function uvk6Reset() {
+  uvState = 0;
+  uvSize = 0;
+  uvBuf = [];
+  uvGot = false;
+  if (uvWaitTimer) { clearTimeout(uvWaitTimer); uvWaitTimer = null; }
+}
+
+function uvk6Push(b) {
+  switch (uvState) {
+    case 0: if (b === 0xAB) uvState = 1; break;
+    case 1: uvState = (b === 0xCD) ? 2 : (b === 0xAB ? 1 : 0); break;
+    case 2: uvSize = b; uvState = 3; break;
+    case 3:
+      uvSize |= b << 8;
+      uvBuf = [];
+      uvState = (uvSize > 0 && uvSize <= 250) ? 4 : 0;
+      break;
+    case 4:
+      uvBuf.push(b);
+      if (uvBuf.length >= uvSize) uvState = 5;
+      break;
+    case 5: uvState = 6; break;                       // 填充字节 1
+    case 6: uvState = 7; break;                       // 填充字节 2
+    case 7: uvState = (b === 0xDC) ? 8 : 0; break;    // 结尾标记 DC BA
+    case 8: if (b === 0xBA) uvk6HandleReply(uvBuf); uvState = 0; break;
+  }
+}
+
+/* 版本后缀 -> EEPROM 容量要求（罗师虎固件命名约定） */
+function uvk6EepromHint(ver) {
+  if (/(HS|H)$/.test(ver)) return "≥2 Mib（中文输入法/开机图片）";
+  if (/(EK|K)$/.test(ver)) return "≥1 Mib（多普勒/开机图片）";
+  return "无需扩容";
+}
+
+function uvk6HandleReply(buf) {
+  if (uvWaitTimer) { clearTimeout(uvWaitTimer); uvWaitTimer = null; }
+  if (buf.length < 4) return;
+  const innerId = buf[0] | (buf[1] << 8);
+
+  if (innerId !== 0x0515) {
+    addSystem("收到未预期的应答 ID 0x" + innerId.toString(16).padStart(4, "0"));
+    return;
+  }
+
+  uvGot = true;
+  let ver = "";
+  for (let i = 0; i < 16 && (4 + i) < buf.length; i++) {
+    const c = buf[4 + i];
+    if (!c) break;
+    ver += String.fromCharCode(c);
+  }
+  const hasAes = buf.length > 20 ? !!(buf[20] & 0xff) : false;
+  const locked = buf.length > 21 ? !!(buf[21] & 0xff) : false;
+
+  addSystem("设备信息 0x0515: 固件版本 = " + (ver || "?") +
+            " | 自定义AES密钥 = " + (hasAes ? "是" : "否") +
+            " | 锁屏 = " + (locked ? "是" : "否"));
+  addSystem("EEPROM 需求: " + uvk6EepromHint(ver));
+
+  $("uvinfo").innerHTML =
+    "固件信息：版本 <b>" + (ver || "?") + "</b>" +
+    " ｜ EEPROM <span class=\"kv\">" + uvk6EepromHint(ver) + "</span>" +
+    " ｜ 密钥 <span class=\"kv\">" + (hasAes ? "已设置" : "默认") + "</span>" +
+    " ｜ 状态 <span class=\"kv\">" + (locked ? "锁屏" : "正常") + "</span>";
+}
+
+/* 一键查询：切 38400 -> 清缓冲 -> 发 0x0514 -> 等 0x0515 */
+async function queryUvk6() {
+  if (!rxChar) { addError("未连接"); return; }
+  try {
+    /* 1) 自动切到 38400（UV-K6 标准波特率） */
+    $("baud").value = UVK6_BAUD;
+    await sendControl("BAUD=" + UVK6_BAUD);
+    await sleep(200);
+
+    /* 2) 清掉链路上的残留数据，避免旧字节污染解析 */
+    await sendControl("FLUSH");
+    await sleep(120);
+
+    /* 3) 组帧并发送 0x0514（4 字节会话时间戳） */
+    uvk6Reset();
+    const ts = Date.now() >>> 0;
+    const data = new Uint8Array([ts & 0xff, (ts >>> 8) & 0xff, (ts >>> 16) & 0xff, (ts >>> 24) & 0xff]);
+    const frame = buildUvk6Frame(0x0514, data);
+    addLine(">>", "UV-K6 查询设备信息: " + toHexString(frame), "sent");
+    await sendBytes(frame);
+
+    /* 4) 超时提示 */
+    uvWaitTimer = setTimeout(() => {
+      uvWaitTimer = null;
+      if (!uvGot) {
+        addSystem("未收到 0x0515 应答：请确认 UV-K6 已开机、写频线接在串口上，且固件为罗师虎(LOSEHU)版本。");
+      }
+    }, 1500);
+  } catch (err) {
+    addError(err.message || String(err));
+  }
 }
 
 /* ---------------- 接收：字节流解析（可跨通知分片） ---------------- */
@@ -208,7 +367,10 @@ function pushData(b) {
 function onData(e) {
   const dv = e.target.value;
   const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
-  for (const b of bytes) feed(b);
+  for (const b of bytes) {
+    uvk6Push(b);   // 原始字节先喂给 UV-K6 协议解析（独立于显示模式）
+    feed(b);       // 再交给终端显示/控制帧解析
+  }
   if (hexMode && hexLine) { addLine("<<", hexLine.trim(), "rx"); hexLine = ""; }
 }
 
@@ -231,6 +393,7 @@ async function connect() {
 
     setConnected(true, device.name || "(未命名)");
     addSystem("已连接 " + (device.name || "") + "，正在查询状态…");
+    uvk6Reset();
     await sendControl("STATUS");
   } catch (err) {
     if (err && err.name === "NotFoundError") return; // 用户取消选择
@@ -241,12 +404,14 @@ async function connect() {
 function onDisconnected() {
   setConnected(false, "已断开");
   addSystem("连接已断开");
+  uvk6Reset();
 }
 
 async function disconnect() {
   try { if (txChar) await txChar.stopNotifications(); } catch (_) {}
   try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
   setConnected(false, "未连接");
+  uvk6Reset();
 }
 
 function setConnected(on, text) {
@@ -254,7 +419,7 @@ function setConnected(on, text) {
   $("dot").classList.toggle("on", on);
   $("btnConnect").disabled = on;
   $("btnDisconnect").disabled = !on;
-  ["btnBaud", "btnStatus", "btnFlush", "btnSelftest", "btnSend", "input"].forEach(id => { $(id).disabled = !on; });
+  ["btnBaud", "btnStatus", "btnFlush", "btnSelftest", "btnUvk6", "btnSend", "input"].forEach(id => { $(id).disabled = !on; });
 }
 
 /* ---------------- 发送 ---------------- */
@@ -337,10 +502,12 @@ $("btnFlush").onclick = async () => {
 $("btnSelftest").onclick = async () => {
   try { await sendControl("SELFTEST"); } catch (err) { addError(err.message || String(err)); }
 };
+$("btnUvk6").onclick = queryUvk6;
 $("btnClear").onclick = () => {
   term.textContent = "";
   decoder = new TextDecoder("utf-8");
   rxLine = ""; hexLine = "";
+  uvk6Reset();
 };
 
 $("hexView").onchange = e => {
@@ -348,6 +515,7 @@ $("hexView").onchange = e => {
   term.textContent = "";
   decoder = new TextDecoder("utf-8");
   rxLine = ""; hexLine = "";
+  uvk6Reset();
   addSystem(hexMode ? "已切换为 HEX 显示" : "已切换为文本显示");
 };
 
