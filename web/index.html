@@ -35,6 +35,8 @@
   #term { margin:0; padding:12px 16px; height:calc(100vh - 210px);
           overflow:auto; white-space:pre-wrap; word-break:break-all;
           line-height:1.45; background:#0b0d11; }
+  #term .ts   { color:var(--dim); }
+  #term .rx   { color:var(--fg); }
   #term .sys  { color:var(--warn); }
   #term .sent { color:var(--accent); }
   #term .err  { color:var(--err); }
@@ -69,7 +71,7 @@
   <span style="flex:1"></span>
   <label><input type="checkbox" id="hexView"> HEX 显示</label>
   <label><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
-  <label><input type="checkbox" id="localEcho"> 本地回显</label>
+  <label><input type="checkbox" id="localEcho" checked> 本地回显</label>
   <button id="btnClear">清屏</button>
 </div>
 
@@ -103,30 +105,43 @@ let device, server, rxChar, txChar;
 let decoder = new TextDecoder("utf-8");
 let hexMode = false;
 
-/* ---------------- 终端输出 ---------------- */
+/* ---------------- 终端输出（带时间戳，按行） ---------------- */
 function scroll() {
   if ($("autoScroll").checked) term.scrollTop = term.scrollHeight;
 }
 function appendNode(node) { term.appendChild(node); scroll(); }
-function addText(s) { appendNode(document.createTextNode(s)); }
-function addSystem(s) {
+
+/* [HH:MM:SS] */
+function ts() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return "[" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "]";
+}
+
+/* 输出一行：dir 为方向标记，如 "<<"(收) / ">>"(发) / "[设备]" / "[错误]" */
+function addLine(dir, text, cls) {
   const span = document.createElement("span");
-  span.className = "sys";
-  span.textContent = "\n[设备] " + s + "\n";
+  if (cls) span.className = cls;
+  const t = document.createElement("span");
+  t.className = "ts";
+  t.textContent = ts() + " ";
+  span.appendChild(t);
+  span.appendChild(document.createTextNode(dir + " " + text + "\n"));
   appendNode(span);
+}
+
+function addSystem(s) {
+  flushRx();
+  addLine("[设备]", s, "sys");
 }
 function addSent(s) {
   if (!$("localEcho").checked) return;
-  const span = document.createElement("span");
-  span.className = "sent";
-  span.textContent = "> " + s;
-  appendNode(span);
+  /* 去掉正文结尾自带的换行，统一按一行显示 */
+  addLine(">>", s.replace(/[\r\n]+$/, ""), "sent");
 }
 function addError(s) {
-  const span = document.createElement("span");
-  span.className = "err";
-  span.textContent = "\n[错误] " + s + "\n";
-  appendNode(span);
+  flushRx();
+  addLine("[错误]", s, "err");
 }
 
 /* ---------------- 接收：字节流解析（可跨通知分片） ---------------- */
@@ -156,18 +171,43 @@ function feed(b) {
   }
 }
 
+/* ---------------- 接收：按行缓冲后带时间戳输出 ---------------- */
+let rxLine = "";   // 文本模式下未凑满一行的接收缓冲
+let hexLine = "";  // HEX 模式下本轮通知累计的字节
+let rxTimer = null;
+
+function flushRx() {
+  if (rxTimer) { clearTimeout(rxTimer); rxTimer = null; }
+  if (rxLine) { addLine("<<", rxLine, "rx"); rxLine = ""; }
+}
+
+/* 若一段时间内没有新数据（对端没发换行），把残留内容也作为一行输出 */
+function scheduleFlush() {
+  if (rxTimer) clearTimeout(rxTimer);
+  rxTimer = setTimeout(() => { rxTimer = null; flushRx(); }, 80);
+}
+
 function pushData(b) {
   if (hexMode) {
-    addText(b.toString(16).padStart(2, "0") + " ");
-  } else {
-    addText(decoder.decode(Uint8Array.of(b), { stream: true }));
+    hexLine += b.toString(16).padStart(2, "0") + " ";
+    return;
   }
+  rxLine += decoder.decode(Uint8Array.of(b), { stream: true });
+  let i;
+  while ((i = rxLine.search(/[\r\n]/)) >= 0) {
+    const line = rxLine.slice(0, i);
+    rxLine = (rxLine[i] === "\r" && rxLine[i + 1] === "\n")
+      ? rxLine.slice(i + 2) : rxLine.slice(i + 1);
+    addLine("<<", line, "rx");
+  }
+  if (rxLine) scheduleFlush();
 }
 
 function onData(e) {
   const dv = e.target.value;
   const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
   for (const b of bytes) feed(b);
+  if (hexMode && hexLine) { addLine("<<", hexLine.trim(), "rx"); hexLine = ""; }
 }
 
 /* ---------------- 连接 / 断开 ---------------- */
@@ -227,10 +267,11 @@ async function sendText() {
   const raw = $("input").value;
   if (!raw) return;
   const text = $("addCRLF").checked ? raw + "\r\n" : raw;
+  /* 先回显再发送：保证本地回显显示在设备响应之前 */
+  addSent(text);
+  $("input").value = "";
   try {
     await sendBytes(new TextEncoder().encode(text));
-    addSent(text);
-    $("input").value = "";
   } catch (err) {
     addError(err.message || String(err));
   }
@@ -263,12 +304,17 @@ $("btnFlush").onclick = async () => {
 $("btnSelftest").onclick = async () => {
   try { await sendControl("SELFTEST"); } catch (err) { addError(err.message || String(err)); }
 };
-$("btnClear").onclick = () => { term.textContent = ""; decoder = new TextDecoder("utf-8"); };
+$("btnClear").onclick = () => {
+  term.textContent = "";
+  decoder = new TextDecoder("utf-8");
+  rxLine = ""; hexLine = "";
+};
 
 $("hexView").onchange = e => {
   hexMode = e.target.checked;
   term.textContent = "";
   decoder = new TextDecoder("utf-8");
+  rxLine = ""; hexLine = "";
   addSystem(hexMode ? "已切换为 HEX 显示" : "已切换为文本显示");
 };
 
