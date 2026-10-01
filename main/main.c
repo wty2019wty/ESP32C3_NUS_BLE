@@ -37,6 +37,13 @@
 
 #include "ble_uart.h"
 
+/* 连接调优需要直接调用 NimBLE GAP API（2M PHY / 连接参数）。
+ * ble_uart 组件 REQUIRES bt，公共依赖会传递过来；main/CMakeLists.txt 亦显式列出 bt。 */
+#include "host/ble_gap.h"
+#ifndef BLE_HCI_LE_PHY_2M_PREF_MASK
+#define BLE_HCI_LE_PHY_2M_PREF_MASK 0x02
+#endif
+
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
 /* ------------------------------------------------------------------ */
@@ -46,6 +53,13 @@
 #define DUT_RX_GPIO         CONFIG_BRIDGE_UART_RX
 #define DEFAULT_BAUD        CONFIG_BRIDGE_BAUD
 #define BUF_SIZE            CONFIG_BRIDGE_BUF_SIZE
+
+/* ---- 连接调优（提速）-------------------------------------------------
+ * K5 协议是“发一帧等一帧 ACK”的停等协议，端到端延迟主要由 BLE 连接间隔决定。
+ * Android 默认常给 30~50ms，这里在连接后主动请求更短间隔 + 2M PHY。 */
+#define TUNE_CONN_ITVL_MIN   6     /* 7.5ms = 6  * 1.25ms */
+#define TUNE_CONN_ITVL_MAX   12    /* 15ms  = 12 * 1.25ms */
+#define TUNE_SUPERVISION_TO  400   /* 4s    = 400 * 10ms  */
 
 /* 控制帧魔术前缀："ESC B L" */
 #define CTL_MAGIC0          0x1B
@@ -69,6 +83,9 @@ static volatile uint32_t    s_uart_rx_total;      /* 从 UART 收到的总字节
 
 /* 自检：同一时刻只允许跑一次 */
 static volatile bool        s_selftest_running;
+
+/* BLE 链路是否已连接（供连接调优任务判断） */
+static volatile bool        s_link_up;
 
 static void selftest_task(void *arg);
 
@@ -201,10 +218,12 @@ static void ble_on_event(const ble_uart_evt_t *e)
         const uint8_t *b = e->connected.peer.bytes;
         ESP_LOGI(TAG, "已连接 %02x:%02x:%02x:%02x:%02x:%02x",
                  b[0], b[1], b[2], b[3], b[4], b[5]);
+        s_link_up = true;   /* 唤醒调优任务：协商 2M PHY 与短连接间隔 */
         break;
     }
     case BLE_UART_EVT_DISCONNECTED:
         ESP_LOGW(TAG, "已断开 reason=0x%x", e->disconnected.reason);
+        s_link_up = false;
         break;
     case BLE_UART_EVT_SUBSCRIBED:
         ESP_LOGI(TAG, "TX 通知%s", e->subscribed.subscribed ? "已订阅" : "已取消");
@@ -258,6 +277,61 @@ static void bridge_uart2ble_task(void *arg)
         for (int retry = 0; rc == BLE_UART_ENOMEM && retry < 20; retry++) {
             vTaskDelay(pdMS_TO_TICKS(5));
             rc = ble_uart_tx(buf, (size_t)n);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 任务：BLE 连接调优（提速）                                           */
+/*                                                                     */
+/* 连接建立后主动做两件事：                                              */
+/*   1) 请求 2M PHY（BLE 5.0，ESP32-C3 支持）：符号率翻倍，大包更明显；  */
+/*   2) 请求更短的连接间隔（7.5~15ms, latency=0）。                      */
+/* 两者都能直接降低“停等协议”每帧的往返延迟，是最有效的固件侧提速手段。   */
+/* 最终由主机拍板，若对端不支持则维持现状（仅打日志，不影响功能）。       */
+/* ------------------------------------------------------------------ */
+
+static void ble_conn_tune_task(void *arg)
+{
+    while (1) {
+        if (!s_link_up) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        /* 等 ATT MTU 协商（及可选加密）完成再调参，避免打断握手 */
+        vTaskDelay(pdMS_TO_TICKS(300));
+        if (!s_link_up) {
+            continue;
+        }
+
+        struct ble_gap_conn_desc desc;
+        for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
+            if (ble_gap_conn_find(h, &desc) != 0) {
+                continue;
+            }
+            int rc = ble_gap_set_prefered_le_phy(h,
+                                                 BLE_HCI_LE_PHY_2M_PREF_MASK,
+                                                 BLE_HCI_LE_PHY_2M_PREF_MASK,
+                                                 0 /* phy_opts：非 coded PHY 填 0 */);
+            ESP_LOGI(TAG, "PHY 调优(2M) conn=%u rc=%d", h, rc);
+
+            const struct ble_gap_upd_params up = {
+                .itvl_min            = TUNE_CONN_ITVL_MIN,
+                .itvl_max            = TUNE_CONN_ITVL_MAX,
+                .latency             = 0,
+                .supervision_timeout = TUNE_SUPERVISION_TO,
+                .min_ce_len          = 0,
+                .max_ce_len          = 0,
+            };
+            rc = ble_gap_update_params(h, &up);
+            ESP_LOGI(TAG, "连接参数调优 conn=%u itvl=%u-%u rc=%d", h,
+                     TUNE_CONN_ITVL_MIN, TUNE_CONN_ITVL_MAX, rc);
+            break;
+        }
+
+        /* 本次连接已调完，等断开后再处理下一次连接 */
+        while (s_link_up) {
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
     }
 }
@@ -373,6 +447,7 @@ void app_main(void)
     configASSERT(s_ble2uart && s_uart2ble);
     xTaskCreate(bridge_ble2uart_task, "b2u", 3072, NULL, 5, NULL);
     xTaskCreate(bridge_uart2ble_task, "u2b", 3072, NULL, 5, NULL);
+    xTaskCreate(ble_conn_tune_task, "tune", 3072, NULL, 4, NULL);
 
     /* 设备名 = "C3-UART-XXXX"（GAP 服务名，连接后可见） */
     uint8_t mac[6] = {0};
